@@ -1,6 +1,6 @@
 # gemini-relay
 
-MMS_ 모의 면접 시뮬레이터의 중계 서버입니다. Unity WebGL과 AI API 사이에서 WebSocket으로 통신을 중계하고, 지원자 답변을 분석하여 다음 면접 질문을 결정합니다.
+MMS_ 미소년 면접 시뮬레이터의 중계 서버입니다. Unity WebGL과 AI API 사이에서 WebSocket으로 통신을 중계하고, 지원자 답변을 분석하여 다음 면접 질문을 결정합니다.
 
 → 클라이언트 레포 : [MMS_](https://github.com/mightycha0826/MMS_)
 
