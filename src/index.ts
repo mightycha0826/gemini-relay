@@ -217,15 +217,17 @@ async function geminiAnalyze(
 
 // ─── HuggingFace — 파인튜닝 모델 추론 ────────────────────────────────────────
 
+// gemma-2b-it에는 system 역할이 없으므로 지시문을 user 턴에 포함시킨다.
 const SYSTEM_PROMPT = `당신은 대학 입시 면접관 AI입니다.
 Gemini 음성 분석 결과와 직전 면접 맥락을 입력받아,
-다음 행동을 결정하고 JSON 패킷 하나만 출력하십시오.
+다음 행동을 결정하고 아래 형식의 JSON 하나만 출력하십시오.
 
 판단 기준:
   follow_up  : 답변이 모호하거나 핵심 키워드 검증이 필요한 경우 → 날카로운 꼬리질문
   next_topic : 답변이 충분히 구체적이거나 새 섹션으로 이동할 경우 → 자연스러운 전환
 
-출력은 반드시 유효한 JSON 하나만 생성하십시오. 설명/마크다운 절대 금지.`;
+출력 형식 (설명/마크다운 절대 금지):
+{"text":"질문 또는 전환 발화","decision":"follow_up","emotion":{"label":"감정 레이블","score":0.0,"intensity":"low"}}`;
 
 interface ModelDecision {
   text:     string;
@@ -241,8 +243,8 @@ async function hfInference(
   modelId:      string,
 ): Promise<ModelDecision> {
 
-  const userMsg = `학과: ${department}\n직전 면접관 질문: ${lastQuestion}\nGemini 분석 결과: ${analysisText}`;
-  const prompt  = `<bos><start_of_turn>system\n${SYSTEM_PROMPT}<end_of_turn>\n<start_of_turn>user\n${userMsg}<end_of_turn>\n<start_of_turn>model\n`;
+  const userMsg = `${SYSTEM_PROMPT}\n\n학과: ${department}\n직전 면접관 질문: ${lastQuestion}\nGemini 분석 결과: ${analysisText}`;
+  const prompt  = `<bos><start_of_turn>user\n${userMsg}<end_of_turn>\n<start_of_turn>model\n`;
 
   const MODEL_URL = `https://api-inference.huggingface.co/models/${modelId}`;
 
@@ -269,21 +271,19 @@ async function hfInference(
   const generated = data[0]?.generated_text ?? '';
 
   try {
-    const match = generated.match(/\{[\s\S]*\}/);
+    const match = generated.match(/\{[\s\S]*?\}/);
     if (!match) throw new Error('JSON not found in model output');
 
     const parsed = JSON.parse(match[0]) as {
-      content?: {
-        text?:     string;
-        decision?: 'follow_up' | 'next_topic';
-        emotion?:  { label: string; score: number; intensity: 'low' | 'medium' | 'high' };
-      };
+      text?:     string;
+      decision?: 'follow_up' | 'next_topic';
+      emotion?:  { label: string; score: number; intensity: 'low' | 'medium' | 'high' };
     };
 
     return {
-      text:     parsed.content?.text     ?? '다음 질문을 해주세요.',
-      decision: parsed.content?.decision ?? 'follow_up',
-      emotion:  parsed.content?.emotion  ?? { label: '중립/전환', score: 0.7, intensity: 'medium' },
+      text:     parsed.text     ?? '다음 질문을 해주세요.',
+      decision: parsed.decision ?? 'follow_up',
+      emotion:  parsed.emotion  ?? { label: '중립/전환', score: 0.7, intensity: 'medium' },
     };
   } catch {
     return {
