@@ -17,9 +17,12 @@
 // ─── Env ──────────────────────────────────────────────────────────────────────
 
 interface Env {
-  GEMINI_API_KEY: string; // wrangler secret put GEMINI_API_KEY
-  HF_TOKEN:       string; // wrangler secret put HF_TOKEN
-  HF_MODEL_ID:    string; // wrangler.toml [vars]
+  GEMINI_API_KEY:      string; // wrangler secret put GEMINI_API_KEY
+  HF_TOKEN:            string; // wrangler secret put HF_TOKEN
+  HF_MODEL_ID:         string; // wrangler.toml [vars]
+  SUPERTONE_API_KEY:   string; // wrangler secret put SUPERTONE_API_KEY
+  SUPERTONE_VOICE_ID:  string; // wrangler.toml [vars]
+  SUPERTONE_MODEL:     string; // wrangler.toml [vars]
 }
 
 // ─── 프로토콜 타입 ────────────────────────────────────────────────────────────
@@ -43,6 +46,7 @@ interface ServerContent {
     text:         string;
     decision:     'follow_up' | 'next_topic';
     emotionLabel: string;
+    audio?:       string; // base64 WAV — Supertone TTS 결과 (실패 시 생략)
   };
   stt_result: string;
   usage:      { timestamp: string };
@@ -169,11 +173,12 @@ async function processInterview(
 ): Promise<ServerContent> {
   const analysisText = await geminiAnalyze(speechText, session.last_question, env.GEMINI_API_KEY);
   const decision     = await hfInference(session.last_question, analysisText, env.HF_TOKEN, env.HF_MODEL_ID);
+  const audio        = await supertoneSpeak(decision.text, env.SUPERTONE_API_KEY, env.SUPERTONE_VOICE_ID, env.SUPERTONE_MODEL);
 
   return {
     type:       'server_content',
     message_id: crypto.randomUUID(),
-    content:    { ...decision },
+    content:    { ...decision, ...(audio ? { audio } : {}) },
     stt_result: speechText,
     usage:      { timestamp: new Date().toISOString() },
   };
@@ -208,6 +213,40 @@ ${ANALYSIS_TEMPLATES}
   );
 
   return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? '답변 분석 결과 없음.';
+}
+
+// ─── Supertone — TTS ──────────────────────────────────────────────────────────
+
+async function supertoneSpeak(
+  text:    string,
+  apiKey:  string,
+  voiceId: string,
+  model:   string,
+): Promise<string | null> {
+  try {
+    const res = await fetch(
+      `https://supertoneapi.com/v1/text-to-speech/${voiceId}/stream`,
+      {
+        method:  'POST',
+        headers: {
+          'x-sup-api-key':  apiKey,
+          'Content-Type':   'application/json',
+          'Accept':         'audio/wav',
+        },
+        body: JSON.stringify({ text, language: 'ko', style: 'neutral', model }),
+      },
+    );
+    if (!res.ok) throw new Error(`Supertone ${res.status}: ${await res.text()}`);
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += 8192) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
+    }
+    return btoa(binary);
+  } catch (e) {
+    console.error('[relay] Supertone TTS 실패:', e);
+    return null;
+  }
 }
 
 // ─── HuggingFace — 파인튜닝 모델 추론 ────────────────────────────────────────
