@@ -4,9 +4,10 @@ compatibility_date = "2025-05-01"
 compatibility_flags = ["nodejs_compat"]
 
 [vars]
-# 자체 배포한 추론 게이트웨이 주소 (nginx → Node 게이트웨이 → Python 추론 서비스)
-# server/index.js 가 실제로 응답하는 도메인/포트를 적을 것 (예: "https://infer.example.com")
-INFER_API_URL = "https://REPLACE_ME.example.com"
+# 자체 배포한 추론 게이트웨이 주소 (Node 게이트웨이 → Python 추론 서비스)
+# 도메인이 없으면 당장은 공인 IP:PORT로 직접 사용 가능 (예: "http://203.0.113.10:3000")
+# 나중에 도메인을 구하면 nginx를 앞에 두고 https 도메인으로 교체할 것.
+INFER_API_URL = "http://REPLACE_ME_WITH_SERVER_IP:3000"
 
 # 아래 시크릿은 wrangler CLI로 별도 등록:
 #   wrangler secret put GEMINI_API_KEY
