@@ -5,10 +5,12 @@ compatibility_flags = ["nodejs_compat"]
 
 [vars]
 # 자체 배포한 추론 게이트웨이 주소.
-# 가정용 PC + 공유기 환경: nginx가 8080에서 받아 Node(127.0.0.1:3000)로 넘겨주므로,
-# 공유기에서 8080을 포트포워딩한 뒤 그 공인 IP:8080 을 적을 것.
-# 예: "http://203.0.113.10:8080"  (공인 IP는 유동일 수 있으니 바뀌면 여기도 갱신할 것)
-INFER_API_URL = "http://REPLACE_ME_WITH_PUBLIC_IP:8080"
+# 가정용 PC + 공유기 환경: ngrok(deploy/start-ngrok.ps1)이 Node 게이트웨이(localhost:3000)를
+# 공인 HTTPS 주소로 터널링해준다 (포트포워딩/방화벽/도메인 불필요).
+# ngrok 실행 시 나오는 https 주소를 그대로 적을 것.
+# 예: "https://a1b2c3d4.ngrok-free.app"
+# 무료 플랜은 재시작마다 주소가 바뀌므로, 계정에서 무료 고정 도메인을 받아 쓰는 걸 권장.
+INFER_API_URL = "https://REPLACE_ME_WITH_NGROK_URL.ngrok-free.app"
 
 # 아래 시크릿은 wrangler CLI로 별도 등록:
 #   wrangler secret put GEMINI_API_KEY
