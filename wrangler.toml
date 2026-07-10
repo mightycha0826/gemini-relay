@@ -4,10 +4,11 @@ compatibility_date = "2025-05-01"
 compatibility_flags = ["nodejs_compat"]
 
 [vars]
-# 자체 배포한 추론 게이트웨이 주소 (Node 게이트웨이 → Python 추론 서비스)
-# 도메인이 없으면 당장은 공인 IP:PORT로 직접 사용 가능 (예: "http://203.0.113.10:3000")
-# 나중에 도메인을 구하면 nginx를 앞에 두고 https 도메인으로 교체할 것.
-INFER_API_URL = "http://REPLACE_ME_WITH_SERVER_IP:3000"
+# 자체 배포한 추론 게이트웨이 주소.
+# 가정용 PC + 공유기 환경: nginx가 8080에서 받아 Node(127.0.0.1:3000)로 넘겨주므로,
+# 공유기에서 8080을 포트포워딩한 뒤 그 공인 IP:8080 을 적을 것.
+# 예: "http://203.0.113.10:8080"  (공인 IP는 유동일 수 있으니 바뀌면 여기도 갱신할 것)
+INFER_API_URL = "http://REPLACE_ME_WITH_PUBLIC_IP:8080"
 
 # 아래 시크릿은 wrangler CLI로 별도 등록:
 #   wrangler secret put GEMINI_API_KEY
