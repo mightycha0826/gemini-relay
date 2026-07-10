@@ -4,9 +4,14 @@ compatibility_date = "2025-05-01"
 compatibility_flags = ["nodejs_compat"]
 
 [vars]
-# HuggingFace에 업로드한 LoRA 모델 ID (예: "your-hf-id/mms-interviewer-lora")
-HF_MODEL_ID = "ai-mms/ai-gemma-lora-model"
+# 자체 배포한 추론 게이트웨이 주소.
+# 가정용 PC + 공유기 환경: ngrok(deploy/start-ngrok.ps1)이 Node 게이트웨이(localhost:3000)를
+# 공인 HTTPS 주소로 터널링해준다 (포트포워딩/방화벽/도메인 불필요).
+# ngrok 실행 시 나오는 https 주소를 그대로 적을 것.
+# 예: "https://a1b2c3d4.ngrok-free.app"
+# 무료 플랜은 재시작마다 주소가 바뀌므로, 계정에서 무료 고정 도메인을 받아 쓰는 걸 권장.
+INFER_API_URL = "https://REPLACE_ME_WITH_NGROK_URL.ngrok-free.app"
 
 # 아래 시크릿은 wrangler CLI로 별도 등록:
 #   wrangler secret put GEMINI_API_KEY
-#   wrangler secret put HF_TOKEN
+#   wrangler secret put INFER_API_TOKEN

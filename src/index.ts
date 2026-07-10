@@ -9,17 +9,17 @@
  * 흐름 (1턴 기준):
  *   1. Unity → session_start (직전 질문)
  *   2. Unity → user_speech  (지원자 답변 텍스트)
- *   3. Worker → Gemini API  : 답변 품질 분석
- *   4. Worker → HuggingFace : 다음 질문 결정
- *   5. Worker → Unity       : server_content 반환
+ *   3. Worker → Gemini API   : 답변 품질 분석
+ *   4. Worker → 자체 추론 서버 (ai/server.py, POST /infer) : 다음 질문 결정
+ *   5. Worker → Unity        : server_content 반환
  */
 
 // ─── Env ──────────────────────────────────────────────────────────────────────
 
 interface Env {
-  GEMINI_API_KEY: string; // wrangler secret put GEMINI_API_KEY
-  HF_TOKEN:       string; // wrangler secret put HF_TOKEN
-  HF_MODEL_ID:    string; // wrangler.toml [vars]
+  GEMINI_API_KEY:  string; // wrangler secret put GEMINI_API_KEY
+  INFER_API_URL:   string; // wrangler.toml [vars] — 우리 Gemma+LoRA 추론 서버 (ai/server.py) 주소
+  INFER_API_TOKEN: string; // wrangler secret put INFER_API_TOKEN
 }
 
 // ─── 프로토콜 타입 ────────────────────────────────────────────────────────────
@@ -77,20 +77,6 @@ const ANALYSIS_TEMPLATES = [
   "답변 완성도 낮음. '{주제}' 부분에서 깊이 있는 후속 질문 권장.",
   '현재 주제 검증 완료. 새로운 섹션 또는 역량 평가 항목으로 이동하십시오.',
 ].map(t => `- ${t}`).join('\n');
-
-// gemma-2b-it에는 system 역할이 없으므로 지시문을 user 턴에 포함시킨다.
-const SYSTEM_PROMPT = `당신은 대학 입시 면접관 AI입니다.
-Gemini 음성 분석 결과와 직전 면접 맥락을 입력받아,
-다음 행동을 결정하고 아래 형식의 JSON 하나만 출력하십시오.
-
-판단 기준:
-  follow_up  : 답변이 모호하거나 핵심 키워드 검증이 필요한 경우 → 날카로운 꼬리질문
-  next_topic : 답변이 충분히 구체적이거나 새 섹션으로 이동할 경우 → 자연스러운 전환
-
-감정 레이블 예시: 날카로움/압박, 압박/재질문, 호기심/탐색, 호기심/기대, 기쁨/격려, 기쁨/지지, 당혹/확인, 중립/전환, 정중함/마무리
-
-출력 형식 (설명/마크다운 절대 금지):
-{"text":"질문 또는 전환 발화","decision":"follow_up","emotionLabel":"감정 레이블"}`;
 
 // ─── 엔트리포인트 ─────────────────────────────────────────────────────────────
 
@@ -168,7 +154,7 @@ async function processInterview(
   env:        Env,
 ): Promise<ServerContent> {
   const analysisText = await geminiAnalyze(speechText, session.last_question, env.GEMINI_API_KEY);
-  const decision     = await hfInference(session.last_question, analysisText, env.HF_TOKEN, env.HF_MODEL_ID);
+  const decision     = await inferDecision(session.last_question, analysisText, env.INFER_API_URL, env.INFER_API_TOKEN);
 
   return {
     type:       'server_content',
@@ -210,38 +196,31 @@ ${ANALYSIS_TEMPLATES}
   return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? '답변 분석 결과 없음.';
 }
 
-// ─── HuggingFace — 파인튜닝 모델 추론 ────────────────────────────────────────
+// ─── 자체 추론 서버 — Gemma-2b-it + LoRA (ai/server.py) ───────────────────────
+//
+// 예전에는 HuggingFace 레거시 Serverless Inference API
+// (`https://api-inference.huggingface.co/models/...`)를 호출했으나 해당
+// 엔드포인트가 폐기되어 DNS조차 해석되지 않는다. 대신 직접 배포한
+// FastAPI 서버(ai/server.py, POST /infer)를 호출한다. 프롬프트 구성과
+// JSON 파싱/폴백은 그 서버 쪽 책임이며, 여기서는 순수 HTTP 호출만 담당한다.
 
-async function hfInference(
+async function inferDecision(
   lastQuestion: string,
   analysisText: string,
-  hfToken:      string,
-  modelId:      string,
+  apiUrl:       string,
+  apiToken:     string,
 ): Promise<ModelDecision> {
-  const prompt =
-    `<bos><start_of_turn>user\n${SYSTEM_PROMPT}\n\n직전 면접관 질문: ${lastQuestion}\nGemini 분석 결과: ${analysisText}<end_of_turn>\n<start_of_turn>model\n`;
-
-  const data = await fetchApi<Array<{ generated_text: string }>>(
-    `https://api-inference.huggingface.co/models/${modelId}`,
-    {
-      method:  'POST',
-      headers: { 'Authorization': `Bearer ${hfToken}`, 'Content-Type': 'application/json' },
-      body:    JSON.stringify({
-        inputs:     prompt,
-        parameters: { max_new_tokens: 300, temperature: 0.7, return_full_text: false, stop_sequences: ['<end_of_turn>'] },
-      }),
-    },
-    'HuggingFace',
-  );
-
-  const generated = data[0]?.generated_text ?? '';
-
   try {
-    const match = generated.match(/\{[\s\S]*\}/); // greedy — 모델 출력 전체에서 마지막 JSON 블록 추출
-    if (!match) throw new Error('JSON not found in model output');
-
-    const parsed = JSON.parse(match[0]) as Partial<ModelDecision>;
-    return { ...DEFAULT_DECISION, ...parsed };
+    const data = await fetchApi<Partial<ModelDecision>>(
+      `${apiUrl.replace(/\/$/, '')}/infer`,
+      {
+        method:  'POST',
+        headers: { 'Authorization': `Bearer ${apiToken}`, 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ last_question: lastQuestion, analysis_text: analysisText }),
+      },
+      'InferAPI',
+    );
+    return { ...DEFAULT_DECISION, ...data };
   } catch {
     return { ...DEFAULT_DECISION };
   }
