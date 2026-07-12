@@ -165,14 +165,27 @@ export class RelayHub implements DurableObject {
       this.aiWorker = ws;
     }
 
-    const targetId = msg.client_session_id;
-    const target    = targetId ? this.clients.get(targetId) : undefined;
-    if (!target) {
-      console.error('[relay] server_content 라우팅 실패 — 대상 client_session_id 없음:', targetId);
+    const enriched = await this.attachAudio(msg);
+    const targetId  = msg.client_session_id;
+
+    // client_session_id 없음 = 특정 답변에 대한 응답이 아닌 초기 질문(PDF 분석 결과 등).
+    // 대상을 특정할 수 없으므로 현재 연결된 모든 Unity 클라이언트에 브로드캐스트한다.
+    if (!targetId) {
+      if (this.clients.size === 0) {
+        console.error('[relay] server_content 브로드캐스트 실패 — 연결된 Unity 클라이언트 없음');
+        return;
+      }
+      for (const client of this.clients.values()) this.trySend(client, enriched);
       return;
     }
 
-    this.trySend(target, await this.attachAudio(msg));
+    const target = this.clients.get(targetId);
+    if (!target) {
+      console.error('[relay] server_content 라우팅 실패 — 대상 client_session_id 연결 안됨:', targetId);
+      return;
+    }
+
+    this.trySend(target, enriched);
   }
 
   private async attachAudio(msg: Record<string, any>): Promise<Record<string, any>> {
