@@ -104,6 +104,7 @@ export default {
     if (request.headers.get('Upgrade') === 'websocket') {
       const { 0: client, 1: server } = new WebSocketPair();
       server.accept();
+      server.send(JSON.stringify({ type: 'ready' })); // accept() 직후 즉시 전송
       handleSession(server, env);
       return new Response(null, { status: 101, webSocket: client });
     }
@@ -126,11 +127,6 @@ export default {
 
 function handleSession(ws: WebSocket, env: Env): void {
   let session: SessionState | null = null;
-
-  // 연결 즉시 ready 전송 — Unity가 session_start 전에 ready를 기다리는 경우 대응
-  ws.addEventListener('open', () => {
-    send(ws, { type: 'ready' });
-  });
 
   ws.addEventListener('message', async (event: MessageEvent) => {
     try {
