@@ -9,7 +9,7 @@ class_name = "RelayHub"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["RelayHub"]
+new_sqlite_classes = ["RelayHub"]
 
 [observability]
 enabled = true
