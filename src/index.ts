@@ -6,11 +6,12 @@
  * 직접 호출한다. relay는 Unity ↔ Python 사이의 JSON 메시지를 그대로
  * 중계하는 역할만 담당한다.
  *
- * 연결 역할 판별:
+ * 연결 역할 판별 (접속 시점에 즉시 확정, 메시지 수신을 기다리지 않음):
  *   - AI worker : session 쿼리파라미터가 AI_WORKER_SESSION_ID 인 연결.
- *                 Python은 반드시 `--session-id ai-worker` 로 접속해야
- *                 relay가 재연결 시에도 즉시 worker로 인식한다.
- *   - Unity 클라이언트 : 그 외 모든 연결.
+ *                 Python은 반드시 `--session-id ai-worker` 로 접속해야 한다.
+ *   - Unity 클라이언트 : 그 외 모든 연결. 접속 즉시 브로드캐스트 대상으로
+ *                 등록되므로, Unity가 먼저 메시지를 보내지 않아도 Python의
+ *                 초기 질문(client_session_id 없는 server_content)을 받을 수 있다.
  *
  * 메시지 흐름:
  *   Unity  → relay  : { type: "client_msg", department, last_question, text, client_session_id? }
@@ -64,7 +65,7 @@ function json(data: unknown, status = 200): Response {
 
 // ─── RelayHub — 모든 WebSocket 연결이 모이는 Durable Object ───────────────────
 
-type Role = 'unclassified' | 'unity' | 'worker';
+type Role = 'unity' | 'worker';
 
 interface ConnMeta {
   id:   string;
@@ -90,8 +91,14 @@ export class RelayHub implements DurableObject {
     server.accept();
 
     const isWorker = connId === AI_WORKER_SESSION_ID;
-    this.connMeta.set(server, { id: connId, role: isWorker ? 'worker' : 'unclassified' });
-    if (isWorker) this.aiWorker = server;
+    const role: Role = isWorker ? 'worker' : 'unity';
+    this.connMeta.set(server, { id: connId, role });
+    if (isWorker) {
+      this.aiWorker = server;
+    } else {
+      // Unity는 먼저 메시지를 안 보내도 연결 즉시 브로드캐스트 대상으로 등록
+      this.clients.set(connId, server);
+    }
 
     // 101 응답이 클라이언트로 반환된 뒤에 ready를 보내기 위해 한 틱 지연
     setTimeout(() => this.trySend(server, { type: 'ready' }), 0);
@@ -131,11 +138,6 @@ export class RelayHub implements DurableObject {
 
   // Unity → Python
   private async routeClientMsg(ws: WebSocket, meta: ConnMeta, msg: Record<string, any>): Promise<void> {
-    if (meta.role === 'unclassified') {
-      meta.role = 'unity';
-      this.clients.set(meta.id, ws);
-    }
-
     if (!msg.text?.trim()) {
       this.trySend(ws, { type: 'error', message: 'Empty text' });
       return;
@@ -156,12 +158,7 @@ export class RelayHub implements DurableObject {
   }
 
   // Python → Unity
-  private routeServerContent(ws: WebSocket, meta: ConnMeta, msg: Record<string, any>): void {
-    if (meta.role === 'unclassified') {
-      meta.role = 'worker';
-      this.aiWorker = ws;
-    }
-
+  private routeServerContent(_ws: WebSocket, _meta: ConnMeta, msg: Record<string, any>): void {
     const targetId = msg.client_session_id;
 
     // client_session_id 없음 = 특정 답변에 대한 응답이 아닌 초기 질문(PDF 분석 결과 등).
