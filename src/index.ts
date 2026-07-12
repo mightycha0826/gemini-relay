@@ -127,13 +127,18 @@ export default {
 function handleSession(ws: WebSocket, env: Env): void {
   let session: SessionState | null = null;
 
+  // 연결 즉시 ready 전송 — Unity가 session_start 전에 ready를 기다리는 경우 대응
+  ws.addEventListener('open', () => {
+    send(ws, { type: 'ready' });
+  });
+
   ws.addEventListener('message', async (event: MessageEvent) => {
     try {
       const msg = JSON.parse(event.data as string) as ClientMsg;
 
       switch (msg.type) {
 
-        // ── 세션 시작 ──────────────────────────────────────────────────────
+        // ── 세션 시작 — last_question 초기화 ──────────────────────────────
         case 'session_start':
           session = { last_question: msg.last_question ?? '' };
           send(ws, { type: 'ready' });
