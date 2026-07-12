@@ -13,15 +13,3 @@ new_sqlite_classes = ["RelayHub"]
 
 [observability]
 enabled = true
-
-[vars]
-# Supertone TTS 설정
-SUPERTONE_VOICE_ID = "4zKPN3fAc5pqNUgrQKfJt6"
-SUPERTONE_MODEL    = "sona_speech_1"
-# voice가 지원하는 style이 확인되기 전까지 비워둠 (비우면 API 기본값 사용).
-# "Voice not found given voiceId, model, style" 400 에러 원인이었음 —
-# Supertone Get Voice API(GET /v1/voices/{voice_id})로 이 voice의 지원 style 확인 후 채울 것.
-SUPERTONE_STYLE = ""
-
-# 아래 시크릿은 wrangler CLI로 별도 등록:
-#   wrangler secret put SUPERTONE_API_KEY
