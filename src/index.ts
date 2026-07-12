@@ -29,6 +29,7 @@ interface Env {
   SUPERTONE_API_KEY:  string; // wrangler secret put SUPERTONE_API_KEY
   SUPERTONE_VOICE_ID: string; // wrangler.toml [vars]
   SUPERTONE_MODEL:    string; // wrangler.toml [vars]
+  SUPERTONE_STYLE:    string; // wrangler.toml [vars] — voice가 지원 안 하면 빈 문자열로 비워 생략
 }
 
 // Python AI worker는 이 session id로 접속해야 relay가 연결 즉시 worker로 인식한다.
@@ -197,6 +198,7 @@ export class RelayHub implements DurableObject {
       this.env.SUPERTONE_API_KEY,
       this.env.SUPERTONE_VOICE_ID,
       this.env.SUPERTONE_MODEL,
+      this.env.SUPERTONE_STYLE,
     );
     if (!audio) return msg;
 
@@ -230,10 +232,14 @@ async function supertoneSpeak(
   apiKey:  string,
   voiceId: string,
   model:   string,
+  style:   string,
 ): Promise<string | null> {
   if (!apiKey || !voiceId) return null;
 
   try {
+    const body: Record<string, string> = { text, language: 'ko', model };
+    if (style) body.style = style; // voice가 지원하지 않는 style이면 400 — 빈 값이면 생략해 API 기본값 사용
+
     const res = await fetch(
       `https://supertoneapi.com/v1/text-to-speech/${voiceId}/stream`,
       {
@@ -243,7 +249,7 @@ async function supertoneSpeak(
           'Content-Type':  'application/json',
           'Accept':        'audio/wav',
         },
-        body: JSON.stringify({ text, language: 'ko', style: 'neutral', model }),
+        body: JSON.stringify(body),
       },
     );
     if (!res.ok) throw new Error(`Supertone ${res.status}: ${await res.text()}`);
