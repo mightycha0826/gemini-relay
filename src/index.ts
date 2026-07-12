@@ -104,7 +104,6 @@ export default {
     if (request.headers.get('Upgrade') === 'websocket') {
       const { 0: client, 1: server } = new WebSocketPair();
       server.accept();
-      server.send(JSON.stringify({ type: 'ready' })); // accept() 직후 즉시 전송
       handleSession(server, env);
       return new Response(null, { status: 101, webSocket: client });
     }
@@ -127,6 +126,9 @@ export default {
 
 function handleSession(ws: WebSocket, env: Env): void {
   let session: SessionState | null = null;
+
+  // 101 응답이 클라이언트로 반환된 뒤에 ready를 보내기 위해 한 틱 지연
+  setTimeout(() => send(ws, { type: 'ready' }), 0);
 
   ws.addEventListener('message', async (event: MessageEvent) => {
     try {
