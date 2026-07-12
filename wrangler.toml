@@ -11,6 +11,9 @@ class_name = "RelayHub"
 tag = "v1"
 new_classes = ["RelayHub"]
 
+[observability]
+enabled = true
+
 [vars]
 # Supertone TTS 설정
 SUPERTONE_VOICE_ID = "4zKPN3fAc5pqNUgrQKfJt6"
