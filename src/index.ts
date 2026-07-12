@@ -1,111 +1,47 @@
 /**
- * gemini-relay — Cloudflare Worker
+ * gemini-relay — Cloudflare Worker (Durable Object 기반 메시지 라우터)
  *
- * Unity WebGL (GeminiClient.cs) ←──wss://──→ 이 Worker
+ * AI 추론(Gemini 답변 분석 + 질문/감정 생성)은 별도 Python 프로세스
+ * (interview_question_generator.py)가 전담한다. relay는 Unity ↔ Python
+ * 사이의 메시지를 중계하고, 최종 질문 텍스트에 Supertone TTS 오디오를
+ * 붙여 Unity로 돌려주는 역할만 담당한다.
  *
- * STT/TTS는 Unity WebGL에서 Web Speech API로 직접 처리.
- * relay는 텍스트만 받아서 분석 + 다음 질문 결정만 담당.
+ * 연결 역할 판별:
+ *   - AI worker : session 쿼리파라미터가 AI_WORKER_SESSION_ID 인 연결.
+ *                 Python은 반드시 `--session-id ai-worker` 로 접속해야
+ *                 relay가 재연결 시에도 즉시 worker로 인식한다.
+ *   - Unity 클라이언트 : 그 외 모든 연결.
  *
- * 흐름 (1턴 기준):
- *   1. Unity → session_start (직전 질문)
- *   2. Unity → user_speech  (지원자 답변 텍스트)
- *   3. Worker → Gemini API  : 답변 품질 분석
- *   4. Worker → HuggingFace : 다음 질문 결정
- *   5. Worker → Unity       : server_content 반환
+ * 메시지 흐름:
+ *   Unity  → relay  : { type: "client_msg", department, last_question, text, client_session_id? }
+ *   relay  → Python : 위 메시지에 client_session_id 를 보정해 그대로 전달
+ *   Python → relay  : { type: "server_content", client_session_id, content: { text, emotion }, ... }
+ *   relay  → Unity  : 위 메시지의 content 에 audio(base64 WAV, Supertone TTS) 를 첨부해 전달
+ *
+ * 서로 다른 WebSocket 연결(Unity, Python) 간 상태 공유가 필요하므로
+ * 모든 연결은 단일 Durable Object 인스턴스(RelayHub)로 라우팅된다.
  */
 
 // ─── Env ──────────────────────────────────────────────────────────────────────
 
 interface Env {
-  GEMINI_API_KEY:      string; // wrangler secret put GEMINI_API_KEY
-  HF_TOKEN:            string; // wrangler secret put HF_TOKEN
-  HF_MODEL_ID:         string; // wrangler.toml [vars]
-  SUPERTONE_API_KEY:   string; // wrangler secret put SUPERTONE_API_KEY
-  SUPERTONE_VOICE_ID:  string; // wrangler.toml [vars]
-  SUPERTONE_MODEL:     string; // wrangler.toml [vars]
+  RELAY_HUB:          DurableObjectNamespace;
+  SUPERTONE_API_KEY:  string; // wrangler secret put SUPERTONE_API_KEY
+  SUPERTONE_VOICE_ID: string; // wrangler.toml [vars]
+  SUPERTONE_MODEL:    string; // wrangler.toml [vars]
 }
 
-// ─── 프로토콜 타입 ────────────────────────────────────────────────────────────
-
-/** Unity → Relay */
-type ClientMsg =
-  | { type: 'session_start'; last_question: string }
-  | { type: 'user_speech';   text: string };
-
-/** Relay → Unity */
-type ServerMsg =
-  | { type: 'ready' }
-  | { type: 'processing' }
-  | ServerContent
-  | { type: 'error'; message: string };
-
-interface ServerContent {
-  type:       'server_content';
-  message_id: string;
-  content: {
-    text:         string;
-    decision:     'follow_up' | 'next_topic';
-    emotionLabel: string;
-    audio?:       string; // base64 WAV — Supertone TTS 결과 (실패 시 생략)
-  };
-  stt_result: string;
-  usage:      { timestamp: string };
-}
-
-interface ModelDecision {
-  text:         string;
-  decision:     'follow_up' | 'next_topic';
-  emotionLabel: string;
-}
-
-/** 세션 내부 상태 */
-interface SessionState {
-  last_question: string;
-}
-
-// ─── 상수 ─────────────────────────────────────────────────────────────────────
-
-const DEFAULT_DECISION: ModelDecision = {
-  text:         '답변 감사합니다. 다음으로 넘어가겠습니다.',
-  decision:     'next_topic',
-  emotionLabel: '중립/전환',
-};
-
-// Gemini 분석 프롬프트용 템플릿 목록
-const ANALYSIS_TEMPLATES = [
-  "'{키워드}' 키워드 언급했으나 메커니즘 설명 없음. 꼬리질문으로 검증 필요.",
-  '이 항목 평가 충분. 자연스러운 주제 전환을 권장합니다.',
-  "'{개념}'에 대한 답변이 추상적입니다. 구체적 근거나 사례 요구 권장.",
-  '면접 진행상 다음 파트로 넘어갈 적절한 시점입니다.',
-  '지원자 답변이 충분히 구체적입니다. 다음 평가 항목으로 전환을 권장합니다.',
-  "답변 완성도 낮음. '{주제}' 부분에서 깊이 있는 후속 질문 권장.",
-  '현재 주제 검증 완료. 새로운 섹션 또는 역량 평가 항목으로 이동하십시오.',
-].map(t => `- ${t}`).join('\n');
-
-// gemma-2b-it에는 system 역할이 없으므로 지시문을 user 턴에 포함시킨다.
-const SYSTEM_PROMPT = `당신은 대학 입시 면접관 AI입니다.
-Gemini 음성 분석 결과와 직전 면접 맥락을 입력받아,
-다음 행동을 결정하고 아래 형식의 JSON 하나만 출력하십시오.
-
-판단 기준:
-  follow_up  : 답변이 모호하거나 핵심 키워드 검증이 필요한 경우 → 날카로운 꼬리질문
-  next_topic : 답변이 충분히 구체적이거나 새 섹션으로 이동할 경우 → 자연스러운 전환
-
-감정 레이블 예시: 날카로움/압박, 압박/재질문, 호기심/탐색, 호기심/기대, 기쁨/격려, 기쁨/지지, 당혹/확인, 중립/전환, 정중함/마무리
-
-출력 형식 (설명/마크다운 절대 금지):
-{"text":"질문 또는 전환 발화","decision":"follow_up","emotionLabel":"감정 레이블"}`;
+// Python AI worker는 이 session id로 접속해야 relay가 연결 즉시 worker로 인식한다.
+const AI_WORKER_SESSION_ID = 'ai-worker';
 
 // ─── 엔트리포인트 ─────────────────────────────────────────────────────────────
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    // WebSocket 업그레이드는 URL 파싱 전에 먼저 확인
     if (request.headers.get('Upgrade') === 'websocket') {
-      const { 0: client, 1: server } = new WebSocketPair();
-      server.accept();
-      handleSession(server, env);
-      return new Response(null, { status: 101, webSocket: client });
+      const id   = env.RELAY_HUB.idFromName('global');
+      const stub = env.RELAY_HUB.get(id);
+      return stub.fetch(request);
     }
 
     const url = new URL(request.url);
@@ -115,107 +51,163 @@ export default {
     }
 
     if (request.method === 'GET' && url.pathname === '/') {
-      return json({ service: 'gemini-relay', version: '1.3.0' });
+      return json({ service: 'gemini-relay', version: '2.0.0' });
     }
 
     return new Response('WebSocket endpoint — wss:// 로 연결하세요.', { status: 426 });
   },
 };
 
-// ─── 세션 핸들러 ──────────────────────────────────────────────────────────────
-
-function handleSession(ws: WebSocket, env: Env): void {
-  let session: SessionState | null = null;
-
-  // 101 응답이 클라이언트로 반환된 뒤에 ready를 보내기 위해 한 틱 지연
-  setTimeout(() => send(ws, { type: 'ready' }), 0);
-
-  ws.addEventListener('message', async (event: MessageEvent) => {
-    try {
-      const msg = JSON.parse(event.data as string) as ClientMsg;
-
-      switch (msg.type) {
-
-        // ── 세션 시작 — last_question 초기화 ──────────────────────────────
-        case 'session_start':
-          session = { last_question: msg.last_question ?? '' };
-          send(ws, { type: 'ready' });
-          break;
-
-        // ── 지원자 답변 텍스트 수신 → 처리 시작 ───────────────────────────
-        case 'user_speech':
-          if (!session)          { sendErr(ws, 'Session not started'); return; }
-          if (!msg.text?.trim()) { sendErr(ws, 'Empty speech text');   return; }
-
-          send(ws, { type: 'processing' });
-
-          try {
-            const result = await processInterview(session, msg.text, env);
-            send(ws, result);
-            session.last_question = result.content.text;
-          } catch (e) {
-            sendErr(ws, e instanceof Error ? e.message : 'Unknown error');
-          }
-          break;
-      }
-    } catch {
-      sendErr(ws, 'Invalid message format');
-    }
+function json(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
   });
-
-  ws.addEventListener('close', () => console.log('[relay] 클라이언트 연결 종료'));
-  ws.addEventListener('error', (e) => console.error('[relay] WebSocket 오류:', e));
 }
 
-// ─── 핵심 처리 ────────────────────────────────────────────────────────────────
+// ─── RelayHub — 모든 WebSocket 연결이 모이는 Durable Object ───────────────────
 
-async function processInterview(
-  session:    SessionState,
-  speechText: string,
-  env:        Env,
-): Promise<ServerContent> {
-  const analysisText = await geminiAnalyze(speechText, session.last_question, env.GEMINI_API_KEY);
-  const decision     = await hfInference(session.last_question, analysisText, env.HF_TOKEN, env.HF_MODEL_ID);
-  const audio        = await supertoneSpeak(decision.text, env.SUPERTONE_API_KEY, env.SUPERTONE_VOICE_ID, env.SUPERTONE_MODEL);
+type Role = 'unclassified' | 'unity' | 'worker';
 
-  return {
-    type:       'server_content',
-    message_id: crypto.randomUUID(),
-    content:    { ...decision, ...(audio ? { audio } : {}) },
-    stt_result: speechText,
-    usage:      { timestamp: new Date().toISOString() },
-  };
+interface ConnMeta {
+  id:   string;
+  role: Role;
 }
 
-// ─── Gemini API — 텍스트 분석 ─────────────────────────────────────────────────
+export class RelayHub implements DurableObject {
+  private clients:  Map<string, WebSocket> = new Map(); // Unity 클라이언트 (client_session_id 기준)
+  private connMeta: Map<WebSocket, ConnMeta> = new Map();
+  private aiWorker: WebSocket | null = null;
 
-async function geminiAnalyze(
-  speechText:   string,
-  lastQuestion: string,
-  apiKey:       string,
-): Promise<string> {
-  const prompt = `당신은 대학 입시 면접 분석 전문가입니다.
-직전 면접관 질문: ${lastQuestion || '(면접 시작)'}
-지원자 답변: ${speechText}
+  constructor(_state: DurableObjectState, private env: Env) {}
 
-위 답변을 분석하여 아래 형식 중 하나로 한 문장만 출력하세요.
-${ANALYSIS_TEMPLATES}
+  async fetch(request: Request): Promise<Response> {
+    if (request.headers.get('Upgrade') !== 'websocket') {
+      return new Response('Expected WebSocket', { status: 426 });
+    }
 
-한 문장만 출력. 다른 설명 금지.`;
+    const url    = new URL(request.url);
+    const connId = url.searchParams.get('session') || crypto.randomUUID();
 
-  const data = await fetchApi<{
-    candidates: Array<{ content: { parts: Array<{ text: string }> } }>;
-  }>(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
-    {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.2 } }),
-    },
-    'Gemini',
-  );
+    const { 0: client, 1: server } = new WebSocketPair();
+    server.accept();
 
-  return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? '답변 분석 결과 없음.';
+    const isWorker = connId === AI_WORKER_SESSION_ID;
+    this.connMeta.set(server, { id: connId, role: isWorker ? 'worker' : 'unclassified' });
+    if (isWorker) this.aiWorker = server;
+
+    // 101 응답이 클라이언트로 반환된 뒤에 ready를 보내기 위해 한 틱 지연
+    setTimeout(() => this.trySend(server, { type: 'ready' }), 0);
+
+    server.addEventListener('message', (event) => this.handleMessage(server, event as MessageEvent));
+    server.addEventListener('close',   () => this.handleClose(server));
+    server.addEventListener('error',   () => this.handleClose(server));
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  private async handleMessage(ws: WebSocket, event: MessageEvent): Promise<void> {
+    let msg: Record<string, any>;
+    try {
+      msg = JSON.parse(event.data as string);
+    } catch {
+      this.trySend(ws, { type: 'error', message: 'Invalid message format' });
+      return;
+    }
+
+    const meta = this.connMeta.get(ws);
+    if (!meta) return;
+
+    switch (msg.type) {
+      case 'client_msg':
+        await this.routeClientMsg(ws, meta, msg);
+        break;
+
+      case 'server_content':
+        await this.routeServerContent(ws, meta, msg);
+        break;
+
+      default:
+        console.log('[relay] 알 수 없는 메시지 type:', msg.type);
+    }
+  }
+
+  // Unity → Python
+  private async routeClientMsg(ws: WebSocket, meta: ConnMeta, msg: Record<string, any>): Promise<void> {
+    if (meta.role === 'unclassified') {
+      meta.role = 'unity';
+      this.clients.set(meta.id, ws);
+    }
+
+    if (!msg.text?.trim()) {
+      this.trySend(ws, { type: 'error', message: 'Empty text' });
+      return;
+    }
+    if (!this.aiWorker) {
+      this.trySend(ws, { type: 'error', message: 'AI worker not connected' });
+      return;
+    }
+
+    const clientSessionId = msg.client_session_id || meta.id;
+    this.trySend(ws, { type: 'processing' });
+
+    const ok = this.trySend(this.aiWorker, { ...msg, client_session_id: clientSessionId });
+    if (!ok) {
+      this.aiWorker = null;
+      this.trySend(ws, { type: 'error', message: 'AI worker not connected' });
+    }
+  }
+
+  // Python → Unity (Supertone TTS 첨부 후 전달)
+  private async routeServerContent(ws: WebSocket, meta: ConnMeta, msg: Record<string, any>): Promise<void> {
+    if (meta.role === 'unclassified') {
+      meta.role = 'worker';
+      this.aiWorker = ws;
+    }
+
+    const targetId = msg.client_session_id;
+    const target    = targetId ? this.clients.get(targetId) : undefined;
+    if (!target) {
+      console.error('[relay] server_content 라우팅 실패 — 대상 client_session_id 없음:', targetId);
+      return;
+    }
+
+    this.trySend(target, await this.attachAudio(msg));
+  }
+
+  private async attachAudio(msg: Record<string, any>): Promise<Record<string, any>> {
+    const text = msg?.content?.text;
+    if (!text) return msg;
+
+    const audio = await supertoneSpeak(
+      text,
+      this.env.SUPERTONE_API_KEY,
+      this.env.SUPERTONE_VOICE_ID,
+      this.env.SUPERTONE_MODEL,
+    );
+    if (!audio) return msg;
+
+    return { ...msg, content: { ...msg.content, audio } };
+  }
+
+  private handleClose(ws: WebSocket): void {
+    const meta = this.connMeta.get(ws);
+    if (meta) {
+      if (meta.role === 'unity') this.clients.delete(meta.id);
+      if (meta.role === 'worker' && this.aiWorker === ws) this.aiWorker = null;
+    }
+    this.connMeta.delete(ws);
+  }
+
+  private trySend(ws: WebSocket, data: unknown): boolean {
+    try {
+      ws.send(JSON.stringify(data));
+      return true;
+    } catch (e) {
+      console.error('[relay] send 실패:', e);
+      return false;
+    }
+  }
 }
 
 // ─── Supertone — TTS ──────────────────────────────────────────────────────────
@@ -226,20 +218,23 @@ async function supertoneSpeak(
   voiceId: string,
   model:   string,
 ): Promise<string | null> {
+  if (!apiKey || !voiceId) return null;
+
   try {
     const res = await fetch(
       `https://supertoneapi.com/v1/text-to-speech/${voiceId}/stream`,
       {
         method:  'POST',
         headers: {
-          'x-sup-api-key':  apiKey,
-          'Content-Type':   'application/json',
-          'Accept':         'audio/wav',
+          'x-sup-api-key': apiKey,
+          'Content-Type':  'application/json',
+          'Accept':        'audio/wav',
         },
         body: JSON.stringify({ text, language: 'ko', style: 'neutral', model }),
       },
     );
     if (!res.ok) throw new Error(`Supertone ${res.status}: ${await res.text()}`);
+
     const bytes = new Uint8Array(await res.arrayBuffer());
     let binary = '';
     for (let i = 0; i < bytes.length; i += 8192) {
@@ -250,65 +245,4 @@ async function supertoneSpeak(
     console.error('[relay] Supertone TTS 실패:', e);
     return null;
   }
-}
-
-// ─── HuggingFace — 파인튜닝 모델 추론 ────────────────────────────────────────
-
-async function hfInference(
-  lastQuestion: string,
-  analysisText: string,
-  hfToken:      string,
-  modelId:      string,
-): Promise<ModelDecision> {
-  const prompt =
-    `<bos><start_of_turn>user\n${SYSTEM_PROMPT}\n\n직전 면접관 질문: ${lastQuestion}\nGemini 분석 결과: ${analysisText}<end_of_turn>\n<start_of_turn>model\n`;
-
-  const data = await fetchApi<Array<{ generated_text: string }>>(
-    `https://api-inference.huggingface.co/models/${modelId}`,
-    {
-      method:  'POST',
-      headers: { 'Authorization': `Bearer ${hfToken}`, 'Content-Type': 'application/json' },
-      body:    JSON.stringify({
-        inputs:     prompt,
-        parameters: { max_new_tokens: 300, temperature: 0.7, return_full_text: false, stop_sequences: ['<end_of_turn>'] },
-      }),
-    },
-    'HuggingFace',
-  );
-
-  const generated = data[0]?.generated_text ?? '';
-
-  try {
-    const match = generated.match(/\{[\s\S]*\}/); // greedy — 모델 출력 전체에서 마지막 JSON 블록 추출
-    if (!match) throw new Error('JSON not found in model output');
-
-    const parsed = JSON.parse(match[0]) as Partial<ModelDecision>;
-    return { ...DEFAULT_DECISION, ...parsed };
-  } catch {
-    return { ...DEFAULT_DECISION };
-  }
-}
-
-// ─── 유틸리티 ─────────────────────────────────────────────────────────────────
-
-/** fetch + 상태 코드 검증을 공통화한 헬퍼 */
-async function fetchApi<T>(url: string, init: RequestInit, label: string): Promise<T> {
-  const res = await fetch(url, init);
-  if (!res.ok) throw new Error(`${label} ${res.status}: ${await res.text()}`);
-  return res.json() as Promise<T>;
-}
-
-function send(ws: WebSocket, data: ServerMsg): void {
-  ws.send(JSON.stringify(data));
-}
-
-function sendErr(ws: WebSocket, message: string): void {
-  send(ws, { type: 'error', message });
-}
-
-function json(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { 'Content-Type': 'application/json' },
-  });
 }
